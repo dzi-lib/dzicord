@@ -27,12 +27,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+import xxhash
 from typing import (
     Any,
     ClassVar,
     Coroutine,
     Dict,
     Iterable,
+    Iterator,
     List,
     Literal,
     NamedTuple,
@@ -47,11 +49,14 @@ from typing import (
 )
 from urllib.parse import quote as _uriquote
 from collections import deque
+from netifaces import interfaces, ifaddresses
+from redis.asyncio import Redis
+from socket import AF_INET
 import datetime
 
 import aiohttp
 
-from .errors import HTTPException, RateLimited, Forbidden, NotFound, LoginFailure, DiscordServerError, GatewayNotFound
+from .errors import HTTPException, RateLimited, Forbidden, NotFound, LoginFailure, DiscordServerError, GatewayNotFound, InvalidRatelimit
 from .gateway import DiscordClientWebSocketResponse
 from .file import File
 from .mentions import AllowedMentions
@@ -116,6 +121,121 @@ async def json_or_text(response: aiohttp.ClientResponse) -> Union[Dict[str, Any]
         pass
 
     return text
+
+
+class Iteration(Iterator):
+    def __init__(self, data: Iterable[Any]):
+        if not isinstance(data, Iterable):
+            raise TypeError("Data must be an iterable")
+        self.data = list(data)
+        self.index = -1
+
+    def __iter__(self) -> Iterator[Any]:
+        return self
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def __next__(self) -> Any:
+        if not self.data:
+            raise StopIteration
+        self.index += 1
+        if self.index >= len(self.data):
+            raise StopIteration
+        return self.data[self.index]
+
+
+class ExpiringDictionary:
+    def __init__(self):
+        self._dict: Dict[str, Any] = {}
+        self._rate_limits: Dict[str, int] = {}
+        self._delete_times: Dict[str, Dict[str, int]] = {}
+        self._loop = asyncio.get_running_loop()
+
+    def _hash_key(self, key: str) -> str:
+        return xxhash.xxh32_hexdigest(key)
+
+    def _do_expiration(self, key: str, expiration: int):
+        def expire():
+            self._dict.pop(key, None)
+        self._loop.call_later(expiration, expire)
+
+    async def set(self, key: str, value: Any, expiration: int = 60) -> int:
+        hashed_key = self._hash_key(key)
+        self._dict[hashed_key] = value
+        if expiration > 0:
+            self._do_expiration(hashed_key, expiration)
+        return 1
+
+    async def remove(self, key: str) -> int:
+        key = self._hash_key(key)
+        if key in self._dict:
+            self._dict.pop(key)
+            return 1
+        return 0
+
+    async def get(self, key: str) -> Optional[Any]:
+        return self._dict.get(self._hash_key(key), None)
+
+    async def sadd(self, key: str, *values: Any, expiration: int = 0) -> int:
+        key = self._hash_key(key)
+        if key in self._dict and not isinstance(self._dict[key], set):
+            raise ValueError(f"Key '{key}' is already in storage, but it's not a set.")
+        self._dict.setdefault(key, set()).update(values)
+        if expiration > 0:
+            self._do_expiration(key, expiration)
+        return len(values)
+
+    async def sismember(self, key: str, value: Any) -> bool:
+        return value in self._dict.get(self._hash_key(key), set())
+
+    async def smembers(self, key: str) -> Optional[set]:
+        return self._dict.get(self._hash_key(key), set())
+
+    async def srem(self, key: str, *values: Any) -> int:
+        key = self._hash_key(key)
+        if key not in self._dict or not isinstance(self._dict[key], set):
+            return 0
+        initial_size = len(self._dict[key])
+        self._dict[key].difference_update(values)
+        return initial_size - len(self._dict[key])
+
+    async def keys(self) -> list:
+        return list(self._dict.keys())
+
+    def is_ratelimited(self, key: str) -> bool:
+        key = self._hash_key(key)
+        return self._dict.get(key, 0) >= self._rate_limits.get(key, 0)
+
+    def time_remaining(self, key: str) -> int:
+        key = self._hash_key(key)
+        if key in self._dict and key in self._delete_times:
+            if self._dict[key] < self._rate_limits.get(key, 0):
+                return 0
+            last_timestamp = self._delete_times[key]['last']
+            bucket = self._delete_times[key]['bucket']
+            return max(0, (last_timestamp + bucket) - int(datetime.datetime.now().timestamp()))
+        return 0
+
+    async def ratelimit(self, key: str, amount: int, bucket: int = 60) -> bool:
+        key = self._hash_key(key)
+        current_timestamp = int(datetime.datetime.now().timestamp())
+
+        if key not in self._dict:
+            self._dict[key] = 1
+            self._rate_limits[key] = amount
+            self._delete_times[key] = {'bucket': bucket, 'last': current_timestamp}
+            self._do_expiration(key, bucket)
+            return False
+
+        if self._delete_times[key]['last'] + bucket <= current_timestamp:
+            self._dict[key] = 1
+            self._delete_times[key]['last'] = current_timestamp
+            self._do_expiration(key, bucket)
+            return False
+
+        self._dict[key] += 1
+        return self._dict[key] >= self._rate_limits[key]
 
 
 class MultipartParameters(NamedTuple):
@@ -506,7 +626,11 @@ class HTTPClient:
         connector: Optional[aiohttp.BaseConnector] = None,
         *,
         proxy: Optional[str] = None,
+        worker_proxy: Optional[str] = None,
         proxy_auth: Optional[aiohttp.BasicAuth] = None,
+        local_addr: Optional[Tuple[str, int]] = None,
+        redis_object: Optional[Redis] = None,
+        iterate_local_addrs: bool = True,
         unsync_clock: bool = True,
         http_trace: Optional[aiohttp.TraceConfig] = None,
         max_ratelimit_timeout: Optional[float] = None,
@@ -526,12 +650,18 @@ class HTTPClient:
         self._global_over: asyncio.Event = MISSING
         self.token: Optional[str] = None
         self.proxy: Optional[str] = proxy
+        self.worker_proxy: Optional[str] = worker_proxy
+        self.local_addr: Optional[Tuple[str, int]] = local_addr
+        self.redis_object: Optional[Redis] = redis_object
+        self.iterate_local_addrs: bool = iterate_local_addrs
+        self.invalid_requests: int = 0
+        self.invalid_ratelimiter: ExpiringDictionary = ExpiringDictionary()
         self.proxy_auth: Optional[aiohttp.BasicAuth] = proxy_auth
         self.http_trace: Optional[aiohttp.TraceConfig] = http_trace
         self.use_clock: bool = not unsync_clock
         self.max_ratelimit_timeout: Optional[float] = max(30.0, max_ratelimit_timeout) if max_ratelimit_timeout else None
 
-        user_agent = 'DiscordBot (https://github.com/Rapptz/discord.py {0}) Python/{1[0]}.{1[1]} aiohttp/{2}'
+        user_agent = 'DiscordBot (https://github.com/Dzi-Lib/dzicord {0}) Python/{1[0]}.{1[1]} aiohttp/{2}'
         self.user_agent: str = user_agent.format(__version__, sys.version_info, aiohttp.__version__)
 
     def clear(self) -> None:
@@ -573,6 +703,12 @@ class HTTPClient:
         self,
         route: Route,
         *,
+        
+        proxy: Optional[str] = None,
+        worker_proxy: Optional[str] = None,
+        local_addr: Optional[Tuple[str, int]] = None,
+        token: Optional[str] = None,
+        
         files: Optional[Sequence[File]] = None,
         form: Optional[Iterable[Dict[str, Any]]] = None,
         **kwargs: Any,
@@ -580,7 +716,26 @@ class HTTPClient:
         method = route.method
         url = route.url
         route_key = route.key
+        
+        local_addr = local_addr or self.local_addr
+        if self.iterate_local_addrs == True and not local_addr:
+            if not hasattr(self, 'address_pool'):
+                try:
+                    network_interface = ifaddresses(interfaces()[1])
+                    self.address_pool = Iteration([
+                        (address['addr'], address['addr'].split(':')[1] if ':' in address['addr'] else 0)
+                        for protocol in network_interface.values()
+                        for address in protocol
+                        if 'broadcast' in address and address['broadcast'].count(':') <= 1
+                    ]) if network_interface else Iteration(())
 
+                    local_addr = next(self.address_pool)
+                
+                except Exception:
+                    self.address_pool = Iteration(())
+            else:
+                local_addr = next(self.address_pool)
+        
         bucket_hash = None
         try:
             bucket_hash = self._bucket_hashes[route_key]
@@ -590,14 +745,22 @@ class HTTPClient:
             key = f'{bucket_hash}:{route.major_parameters}'
 
         ratelimit = self.get_ratelimit(key)
+        ip_key = f":{local_addr}" if local_addr else f":{proxy}" if proxy else ""
+
+        if self.invalid_ratelimiter.is_ratelimited("invalid_requests"):
+            raise InvalidRatelimit(self.invalid_ratelimiter.time_remaining("invalid_requests"))
 
         # header creation
         headers: Dict[str, str] = {
             'User-Agent': self.user_agent,
         }
 
-        if self.token is not None:
-            headers['Authorization'] = 'Bot ' + self.token
+        if local_addr != self.local_addr:
+            self.__session._connector = aiohttp.TCPConnector(local_addr=local_addr, limit=0, family=AF_INET)
+
+        if (token or self.token):
+            headers['Authorization'] = token if token else f'Bot {self.token}'
+            
         # some checking if it's a JSON request
         if 'json' in kwargs:
             headers['Content-Type'] = 'application/json'
@@ -618,6 +781,9 @@ class HTTPClient:
             kwargs['proxy'] = self.proxy
         if self.proxy_auth is not None:
             kwargs['proxy_auth'] = self.proxy_auth
+            
+        if (worker_proxy or self.worker_proxy):
+            url = f'{worker_proxy or self.worker_proxy}?url={url}'
 
         if not self._global_over.is_set():
             # wait until the global lock is complete
@@ -644,7 +810,9 @@ class HTTPClient:
 
                         # even errors have text involved in them so this is safe to call
                         data = await json_or_text(response)
-
+                        if (local_addr != self.local_addr) and self.local_addr:
+                            self.__session._connector = self.connector
+                            
                         # Update and use rate limit information if the bucket header is present
                         discord_hash = response.headers.get('X-Ratelimit-Bucket')
                         # I am unsure if X-Ratelimit-Bucket is always available
@@ -750,7 +918,11 @@ class HTTPClient:
                         if response.status in {500, 502, 504, 524}:
                             await asyncio.sleep(1 + tries * 2)
                             continue
-
+                        
+                        self.invalid_requests += 1
+                        if await self.invalid_ratelimiter.ratelimit("invalid_requests", int(1e4), 600):
+                            raise InvalidRatelimit(self.invalid_ratelimiter.time_remaining("invalid_requests"))
+                        
                         # the usual error cases
                         if response.status == 403:
                             raise Forbidden(response, data)
@@ -810,7 +982,7 @@ class HTTPClient:
     async def static_login(self, token: str) -> user.User:
         # Necessary to get aiohttp to stop complaining about session creation
         if self.connector is MISSING:
-            self.connector = aiohttp.TCPConnector(limit=0)
+            self.connector = aiohttp.TCPConnector(local_addr=self.local_addr, limit=0, family=AF_INET, resolver=aiohttp.AsyncResolver())
 
         self.__session = aiohttp.ClientSession(
             connector=self.connector,
@@ -945,6 +1117,19 @@ class HTTPClient:
             emoji=emoji,
         )
         return self.request(r)
+    
+    def get_profile(
+        self,
+        token: str,
+        user_id: Snowflake,
+        guild_id: Optional[Snowflake] = None,
+        proxy: Optional[str] = None
+    ) -> Response[Dict[str, Any]]:
+         return self.request(
+            Route('GET', '/users/{user_id}/profile', metadata=None, user_id=user_id, **({'guild_id': guild_id} if guild_id is not None else {})),
+            proxy=proxy,
+            token=token
+        )
 
     def get_reaction_users(
         self,

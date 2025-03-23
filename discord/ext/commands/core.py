@@ -412,10 +412,13 @@ class Command(_BaseCommand, Generic[CogT, P, T]):
         else:
             help_doc = extract_descriptions_from_docstring(func, self.params)
 
+        self._permissions: List[str] = []
+        self._bot_permissions: List[str] = []
         self.help: Optional[str] = help_doc
-
         self.brief: Optional[str] = kwargs.get('brief')
         self.usage: Optional[str] = kwargs.get('usage')
+        self.example: Optional[str] = kwargs.get('example')
+        self.parameters: Dict[Any, Any] = kwargs.get('parameters', {})
         self.rest_is_raw: bool = kwargs.get('rest_is_raw', False)
         self.aliases: Union[List[str], Tuple[str]] = kwargs.get('aliases', [])
         self.extras: Dict[Any, Any] = kwargs.get('extras', {})
@@ -478,6 +481,18 @@ class Command(_BaseCommand, Generic[CogT, P, T]):
             pass
         else:
             self.after_invoke(after_invoke)
+            
+    @property
+    def permissions(self) -> Optional[Union[List[str], str]]:
+        if not self._permissions:
+            return None
+        return len(self._permissions)-1 and self._permissions or self._permissions[0]
+
+    @property
+    def bot_permissions(self) -> Optional[Union[List[str], str]]:
+        if not self._bot_permissions:
+            return None
+        return len(self._bot_permissions)-1 and self._bot_permissions or self._bot_permissions[0]
 
     @property
     def cog(self) -> CogT:

@@ -145,6 +145,12 @@ class HTTPException(DiscordException):
         super().__init__(fmt.format(self.response, self.code, self.text))
 
 
+class InvalidRatelimit(DiscordException):
+    def __init__(self, retry_after: float):
+        self.retry_after = retry_after
+        super().__init__(f'Too many invalid requests. Retry in {retry_after:.2f} seconds.')
+
+
 class RateLimited(DiscordException):
     """Exception that's raised for when status code 429 occurs
     and the timeout is greater than the configured maximum using

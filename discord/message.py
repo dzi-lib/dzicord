@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
-import re
+import regex as re
 import io
 from os import PathLike
 from typing import (
@@ -2842,6 +2842,11 @@ class Message(PartialMessage, Hashable):
 
         # Fallback for unknown message types
         return ''
+    
+    def mentions_bot(self, strict: bool = False) -> bool:
+        if strict is True:
+            return self.content in (f'<@{self._state.self_id}>', f'<@!{self._state.self_id}>')
+        return bool(re.findall(r'<@!?(\d+)>', self.content))
 
     @overload
     async def edit(
