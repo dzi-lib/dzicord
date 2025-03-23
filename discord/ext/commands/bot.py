@@ -192,6 +192,8 @@ class BotBase(GroupMixin[None]):
         self.owner_id: Optional[int] = options.get('owner_id')
         self.owner_ids: Optional[Collection[int]] = options.get('owner_ids', set())
         self.strip_after_prefix: bool = options.get('strip_after_prefix', False)
+        
+        self.check(self.fill_permissions)
 
         if self.owner_id and self.owner_ids:
             raise TypeError('Both owner_id and owner_ids are set.')
@@ -895,6 +897,41 @@ class BotBase(GroupMixin[None]):
     def cogs(self) -> Mapping[str, Cog]:
         """Mapping[:class:`str`, :class:`Cog`]: A read-only mapping of cog name to cog."""
         return types.MappingProxyType(self.__cogs)
+    
+    async def _fill_permissions(self, ctx: Context[BotT]) -> None:
+        original_user_permissions = ctx.permissions.value
+        original_bot_permissions = ctx.bot_permissions.value
+
+        for command in self.walk_commands():
+            if not command._permissions or not command._bot_permissions:
+                command._permissions = ['send_messages']
+                command._bot_permissions = ['send_messages']
+
+                for check in command.checks or []:
+                    try:
+                        if 'has_permissions' in str(check):
+                            ctx.permissions.value = 0
+                            invoke = check(ctx)
+                            command._permissions = list(invoke.cr_frame.f_locals[next(iter(invoke.cr_frame.f_locals))].keys()) # type: ignore
+                        elif 'bot_has_permissions' in str(check):
+                            ctx.bot_permissions.value = 0
+                            invoke = check(ctx)
+                            command._bot_permissions = list(invoke.cr_frame.f_locals[next(iter(invoke.cr_frame.f_locals))].keys()) # type: ignore
+                    except errors.MissingPermissions as err:
+                        command._permissions = err.missing_permissions
+                    except errors.BotMissingPermissions as err:
+                        command._bot_permissions = err.missing_permissions
+                    except (RuntimeWarning, Exception):
+                        pass
+
+        ctx.permissions.value = original_user_permissions
+        ctx.bot_permissions.value = original_bot_permissions
+
+    async def fill_permissions(self, ctx: Context[BotT]) -> bool:
+        if not getattr(self, 'permissions_filled', False):
+            self.permissions_filled = True
+            self.loop.create_task(self._fill_permissions(ctx)) # type: ignore
+        return True
 
     # extensions
 
