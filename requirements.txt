@@ -1,4 +1,4 @@
-aiohttp>=3.7.4,<4
+aiohttp>=3.7.4,<=3.9.5
 audioop-lts; python_version>='3.13'
 regex
 redis
