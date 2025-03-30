@@ -47,6 +47,7 @@ from typing import (
 )
 
 import aiohttp
+from redis.asyncio import Redis
 
 from .sku import SKU, Entitlement
 from .user import User, ClientUser
@@ -282,6 +283,10 @@ class Client:
 
         connector: Optional[aiohttp.BaseConnector] = options.get('connector', None)
         proxy: Optional[str] = options.pop('proxy', None)
+        worker_proxy: Optional[str] = options.pop('worker_proxy', None)
+        local_addr: Optional[Tuple[str, int]] = options.pop('local_addr', None)
+        redis_object: Optional[Redis] = options.pop('redis_object', None)
+        iterate_local_addrs: bool = options.pop('iterate_local_addrs', False)
         proxy_auth: Optional[aiohttp.BasicAuth] = options.pop('proxy_auth', None)
         unsync_clock: bool = options.pop('assume_unsync_clock', True)
         http_trace: Optional[aiohttp.TraceConfig] = options.pop('http_trace', None)
@@ -290,6 +295,10 @@ class Client:
             self.loop,
             connector,
             proxy=proxy,
+            worker_proxy=worker_proxy,
+            local_addr=local_addr,
+            redis_object=redis_object,
+            iterate_local_addrs=iterate_local_addrs,
             proxy_auth=proxy_auth,
             unsync_clock=unsync_clock,
             http_trace=http_trace,

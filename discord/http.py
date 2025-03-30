@@ -989,7 +989,7 @@ class HTTPClient:
     async def static_login(self, token: str) -> user.User:
         # Necessary to get aiohttp to stop complaining about session creation
         if self.connector is MISSING:
-            self.connector = aiohttp.TCPConnector(local_addr=self.local_addr, limit=0, family=AF_INET, resolver=aiohttp.AsyncResolver())
+            self.connector = aiohttp.TCPConnector(local_addr=self.local_addr, limit=0, family=AF_INET)
 
         self.__session = aiohttp.ClientSession(
             connector=self.connector,
