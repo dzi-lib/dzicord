@@ -150,15 +150,20 @@ class ExpiringDictionary:
         self._dict: Dict[str, Any] = {}
         self._rate_limits: Dict[str, int] = {}
         self._delete_times: Dict[str, Dict[str, int]] = {}
-        self._loop = asyncio.get_event_loop()
+        self._loop = None
 
     def _hash_key(self, key: str) -> str:
         return xxhash.xxh32_hexdigest(key)
 
+    def _get_loop(self):
+        if self._loop is None:
+            self._loop = asyncio.get_running_loop()
+        return self._loop
+
     def _do_expiration(self, key: str, expiration: int):
         def expire():
             self._dict.pop(key, None)
-        self._loop.call_later(expiration, expire)
+        self._get_loop().call_later(expiration, expire)
 
     async def set(self, key: str, value: Any, expiration: int = 60) -> int:
         hashed_key = self._hash_key(key)
