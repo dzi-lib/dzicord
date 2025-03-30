@@ -668,7 +668,7 @@ class HTTPClient:
         self.use_clock: bool = not unsync_clock
         self.max_ratelimit_timeout: Optional[float] = max(30.0, max_ratelimit_timeout) if max_ratelimit_timeout else None
 
-        user_agent = 'Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)'
+        user_agent = 'DiscordBot (https://github.com/dzi-lib/dzicord {0}) Python/{1[0]}.{1[1]} aiohttp/{2}'
         self.user_agent: str = user_agent.format(__version__, sys.version_info, aiohttp.__version__)
 
     def clear(self) -> None:
@@ -763,7 +763,7 @@ class HTTPClient:
         }
 
         if local_addr != self.local_addr:
-            self.__session._connector = aiohttp.TCPConnector(local_addr=local_addr, limit=0, family=AF_INET)
+            self.__session._connector = aiohttp.TCPConnector(local_addr=local_addr, limit=0, family=AF_INET, resolver=aiohttp.AsyncResolver())
 
         if (token or self.token):
             headers['Authorization'] = token if token else f'Bot {self.token}'
@@ -989,7 +989,7 @@ class HTTPClient:
     async def static_login(self, token: str) -> user.User:
         # Necessary to get aiohttp to stop complaining about session creation
         if self.connector is MISSING:
-            self.connector = aiohttp.TCPConnector(local_addr=self.local_addr, limit=0, family=AF_INET)
+            self.connector = aiohttp.TCPConnector(local_addr=self.local_addr, limit=0, family=AF_INET, resolver=aiohttp.AsyncResolver())
 
         self.__session = aiohttp.ClientSession(
             connector=self.connector,
