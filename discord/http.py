@@ -205,6 +205,8 @@ class ExpiringDictionary:
 
     def is_ratelimited(self, key: str) -> bool:
         key = self._hash_key(key)
+        if not self._dict.get(key):
+            return False
         return self._dict.get(key, 0) >= self._rate_limits.get(key, 0)
 
     def time_remaining(self, key: str) -> int:
